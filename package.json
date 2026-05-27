@@ -1,0 +1,20 @@
+{
+  "name": "sijang",
+  "version": "1.0.0",
+  "description": "Sijang - Adaptable AI Telegram Bot powered by Gemini",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0",
+    "@google/generative-ai": "^0.21.0",
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "better-sqlite3": "^11.1.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
