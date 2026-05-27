@@ -43,11 +43,19 @@ async function chat(messages, userMessage) {
       systemInstruction: SYSTEM_PROMPT
     })
     
-    // Build chat history
-    const history = messages.map(m => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content }]
-    }))
+    // Build chat history - filter out empty messages
+    const history = messages
+      .filter(m => m.content && m.content.trim())
+      .map(m => ({
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: m.content }]
+      }))
+    
+    // If no history, just generate content directly
+    if (history.length === 0) {
+      const result = await model.generateContent(userMessage)
+      return result.response.text()
+    }
     
     const chat = model.startChat({ history })
     const result = await chat.sendMessage(userMessage)
@@ -55,7 +63,7 @@ async function chat(messages, userMessage) {
     
     return response
   } catch (error) {
-    console.error('Gemini error:', error.message)
+    console.error('Gemini error:', error.message, error.stack)
     throw error
   }
 }
