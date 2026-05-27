@@ -12,7 +12,7 @@
     "@google/generative-ai": "^0.21.0",
     "axios": "^1.7.2",
     "dotenv": "^16.4.5",
-    "better-sqlite3": "^11.1.2"
+    "sql.js": "^1.10.3"
   },
   "engines": {
     "node": ">=18"

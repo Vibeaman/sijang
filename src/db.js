@@ -1,17 +1,34 @@
 /**
- * Sijang - Database (SQLite)
+ * Sijang - Database (sql.js - no native bindings)
  * Stores user data, conversation history, and memory
  */
 
-const Database = require('better-sqlite3')
+const initSqlJs = require('sql.js')
+const fs = require('fs')
 const path = require('path')
 
-const db = new Database(path.join(__dirname, '..', 'sijang.db'))
+const DB_PATH = path.join(__dirname, '..', 'sijang.db')
 
-// Initialize tables
-function initDb() {
-  db.exec(`
-    -- Users table
+let db = null
+
+// Initialize database
+async function initDb() {
+  const SQL = await initSqlJs()
+  
+  // Try to load existing database
+  try {
+    if (fs.existsSync(DB_PATH)) {
+      const buffer = fs.readFileSync(DB_PATH)
+      db = new SQL.Database(buffer)
+    } else {
+      db = new SQL.Database()
+    }
+  } catch (e) {
+    db = new SQL.Database()
+  }
+  
+  // Create tables
+  db.run(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       telegram_id INTEGER UNIQUE NOT NULL,
@@ -20,18 +37,20 @@ function initDb() {
       personality_mode TEXT DEFAULT 'adaptive',
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-
-    -- Conversation history (for context)
+    )
+  `)
+  
+  db.run(`
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       telegram_id INTEGER NOT NULL,
       role TEXT NOT NULL,
       content TEXT NOT NULL,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-
-    -- Long-term memory
+    )
+  `)
+  
+  db.run(`
     CREATE TABLE IF NOT EXISTS memory (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       telegram_id INTEGER NOT NULL,
@@ -39,9 +58,10 @@ function initDb() {
       value TEXT NOT NULL,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(telegram_id, key)
-    );
-
-    -- Reminders
+    )
+  `)
+  
+  db.run(`
     CREATE TABLE IF NOT EXISTS reminders (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       telegram_id INTEGER NOT NULL,
@@ -49,29 +69,66 @@ function initDb() {
       remind_at DATETIME NOT NULL,
       is_sent INTEGER DEFAULT 0,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-
-    -- Create indexes
-    CREATE INDEX IF NOT EXISTS idx_messages_telegram_id ON messages(telegram_id);
-    CREATE INDEX IF NOT EXISTS idx_memory_telegram_id ON memory(telegram_id);
-    CREATE INDEX IF NOT EXISTS idx_reminders_remind_at ON reminders(remind_at);
+    )
   `)
   
+  saveDb()
   console.log('💾 Database initialized')
+}
+
+// Save database to file
+function saveDb() {
+  if (!db) return
+  try {
+    const data = db.export()
+    const buffer = Buffer.from(data)
+    fs.writeFileSync(DB_PATH, buffer)
+  } catch (e) {
+    console.error('DB save error:', e.message)
+  }
+}
+
+// Helper to run queries
+function run(sql, params = []) {
+  db.run(sql, params)
+  saveDb()
+}
+
+function get(sql, params = []) {
+  const stmt = db.prepare(sql)
+  stmt.bind(params)
+  if (stmt.step()) {
+    const row = stmt.getAsObject()
+    stmt.free()
+    return row
+  }
+  stmt.free()
+  return null
+}
+
+function all(sql, params = []) {
+  const stmt = db.prepare(sql)
+  stmt.bind(params)
+  const rows = []
+  while (stmt.step()) {
+    rows.push(stmt.getAsObject())
+  }
+  stmt.free()
+  return rows
 }
 
 // User functions
 function getOrCreateUser(telegramId, username, firstName) {
-  let user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(telegramId)
+  let user = get('SELECT * FROM users WHERE telegram_id = ?', [telegramId])
   
   if (!user) {
-    db.prepare('INSERT INTO users (telegram_id, username, first_name) VALUES (?, ?, ?)')
-      .run(telegramId, username, firstName)
-    user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(telegramId)
+    run('INSERT INTO users (telegram_id, username, first_name) VALUES (?, ?, ?)',
+      [telegramId, username, firstName])
+    user = get('SELECT * FROM users WHERE telegram_id = ?', [telegramId])
     console.log(`✨ New user: ${firstName || username} (${telegramId})`)
   } else {
-    db.prepare('UPDATE users SET last_seen = CURRENT_TIMESTAMP, username = ?, first_name = ? WHERE telegram_id = ?')
-      .run(username, firstName, telegramId)
+    run('UPDATE users SET last_seen = CURRENT_TIMESTAMP, username = ?, first_name = ? WHERE telegram_id = ?',
+      [username, firstName, telegramId])
   }
   
   return user
@@ -79,76 +136,83 @@ function getOrCreateUser(telegramId, username, firstName) {
 
 // Message history functions
 function addMessage(telegramId, role, content) {
-  db.prepare('INSERT INTO messages (telegram_id, role, content) VALUES (?, ?, ?)')
-    .run(telegramId, role, content)
+  run('INSERT INTO messages (telegram_id, role, content) VALUES (?, ?, ?)',
+    [telegramId, role, content])
 }
 
 function getRecentMessages(telegramId, limit = 20) {
-  return db.prepare(`
-    SELECT role, content FROM messages 
-    WHERE telegram_id = ? 
-    ORDER BY created_at DESC 
-    LIMIT ?
-  `).all(telegramId, limit).reverse()
+  return all(
+    `SELECT role, content FROM messages 
+     WHERE telegram_id = ? 
+     ORDER BY created_at DESC 
+     LIMIT ?`,
+    [telegramId, limit]
+  ).reverse()
 }
 
 function clearHistory(telegramId) {
-  db.prepare('DELETE FROM messages WHERE telegram_id = ?').run(telegramId)
+  run('DELETE FROM messages WHERE telegram_id = ?', [telegramId])
 }
 
 // Memory functions
 function remember(telegramId, key, value) {
-  db.prepare(`
-    INSERT INTO memory (telegram_id, key, value) VALUES (?, ?, ?)
-    ON CONFLICT(telegram_id, key) DO UPDATE SET value = ?, created_at = CURRENT_TIMESTAMP
-  `).run(telegramId, key, value, value)
+  // Try update first, then insert
+  const existing = get('SELECT id FROM memory WHERE telegram_id = ? AND key = ?', [telegramId, key])
+  if (existing) {
+    run('UPDATE memory SET value = ?, created_at = CURRENT_TIMESTAMP WHERE telegram_id = ? AND key = ?',
+      [value, telegramId, key])
+  } else {
+    run('INSERT INTO memory (telegram_id, key, value) VALUES (?, ?, ?)',
+      [telegramId, key, value])
+  }
 }
 
 function recall(telegramId, key) {
-  const row = db.prepare('SELECT value FROM memory WHERE telegram_id = ? AND key = ?').get(telegramId, key)
+  const row = get('SELECT value FROM memory WHERE telegram_id = ? AND key = ?', [telegramId, key])
   return row?.value
 }
 
 function getAllMemories(telegramId) {
-  return db.prepare('SELECT key, value FROM memory WHERE telegram_id = ?').all(telegramId)
+  return all('SELECT key, value FROM memory WHERE telegram_id = ?', [telegramId])
 }
 
 function forget(telegramId, key) {
-  db.prepare('DELETE FROM memory WHERE telegram_id = ? AND key = ?').run(telegramId, key)
+  run('DELETE FROM memory WHERE telegram_id = ? AND key = ?', [telegramId, key])
 }
 
 // Reminder functions
 function addReminder(telegramId, message, remindAt) {
-  const result = db.prepare('INSERT INTO reminders (telegram_id, message, remind_at) VALUES (?, ?, ?)')
-    .run(telegramId, message, remindAt)
-  return result.lastInsertRowid
+  run('INSERT INTO reminders (telegram_id, message, remind_at) VALUES (?, ?, ?)',
+    [telegramId, message, remindAt])
+  const row = get('SELECT last_insert_rowid() as id')
+  return row?.id
 }
 
 function getDueReminders() {
-  return db.prepare(`
-    SELECT * FROM reminders 
-    WHERE is_sent = 0 AND datetime(remind_at) <= datetime('now')
-  `).all()
+  return all(
+    `SELECT * FROM reminders 
+     WHERE is_sent = 0 AND datetime(remind_at) <= datetime('now')`
+  )
 }
 
 function markReminderSent(id) {
-  db.prepare('UPDATE reminders SET is_sent = 1 WHERE id = ?').run(id)
+  run('UPDATE reminders SET is_sent = 1 WHERE id = ?', [id])
 }
 
 function getUserReminders(telegramId) {
-  return db.prepare(`
-    SELECT * FROM reminders 
-    WHERE telegram_id = ? AND is_sent = 0 
-    ORDER BY remind_at ASC
-  `).all(telegramId)
+  return all(
+    `SELECT * FROM reminders 
+     WHERE telegram_id = ? AND is_sent = 0 
+     ORDER BY remind_at ASC`,
+    [telegramId]
+  )
 }
 
 function deleteReminder(id, telegramId) {
-  db.prepare('DELETE FROM reminders WHERE id = ? AND telegram_id = ?').run(id, telegramId)
+  run('DELETE FROM reminders WHERE id = ? AND telegram_id = ?', [id, telegramId])
 }
 
 module.exports = {
-  db,
   initDb,
   getOrCreateUser,
   addMessage,

@@ -45,7 +45,7 @@ const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true })
 console.log(`🤖 ${BOT_NAME} starting...`)
 
 // Initialize
-initDb()
+initDb().then(() => console.log('💾 DB ready')).catch(e => console.error('DB error:', e))
 
 // Parse time strings like "5m", "2h", "1d", "tomorrow 9am"
 function parseTime(timeStr) {
