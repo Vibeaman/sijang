@@ -25,8 +25,10 @@ const {
 const { chat, chatWithImage } = require('./services/gemini')
 const { getPrice, formatPrice, formatChange, formatMarketCap, getTrending } = require('./services/crypto')
 const { search, getDefinition } = require('./services/search')
+const github = require('./services/github')
 
 const BOT_NAME = process.env.BOT_NAME || 'Sijang'
+const OWNER_ID = process.env.OWNER_TELEGRAM_ID ? parseInt(process.env.OWNER_TELEGRAM_ID) : null
 
 // Validate env
 if (!process.env.BOT_TOKEN) {
@@ -124,10 +126,15 @@ bot.onText(/\/help/, async (msg) => {
     `/forget [key] - Delete memory\n\n` +
     `*Reminders*\n` +
     `/remind [time] [message]\n` +
-    `  e.g. /remind 30m call mom\n` +
-    `  e.g. /remind 2h check oven\n` +
     `/reminders - List pending\n` +
-    `/cancel [id] - Cancel reminder`,
+    `/cancel [id] - Cancel reminder\n\n` +
+    `*GitHub (Owner Only)*\n` +
+    `/repos - List your repos\n` +
+    `/newrepo [name] [desc] - Create repo\n` +
+    `/files [repo] [path] - List files\n` +
+    `/cat [repo] [file] - Read file\n` +
+    `/push [repo] [file] - Push (reply to msg)\n` +
+    `/gist [desc] - Create gist (reply to msg)`,
     { parse_mode: 'Markdown' }
   )
 })
@@ -395,6 +402,228 @@ setInterval(async () => {
     }
   }
 }, 60 * 1000)
+
+// ========== GITHUB COMMANDS ==========
+// Owner-only check helper
+function isOwner(userId) {
+  if (!OWNER_ID) return true // If no owner set, allow all
+  return userId === OWNER_ID
+}
+
+// /repos command - list repos
+bot.onText(/\/repos/, async (msg) => {
+  const chatId = msg.chat.id
+  const userId = msg.from.id
+  
+  if (!isOwner(userId)) {
+    await bot.sendMessage(chatId, '🔒 This command is owner-only.')
+    return
+  }
+  
+  if (!process.env.GITHUB_TOKEN) {
+    await bot.sendMessage(chatId, '❌ GitHub not configured.')
+    return
+  }
+  
+  await bot.sendChatAction(chatId, 'typing')
+  
+  try {
+    const repos = await github.listRepos(10)
+    let text = `📦 *Your Repos* (${github.GITHUB_USERNAME})\n\n`
+    repos.forEach(r => {
+      const icon = r.private ? '🔒' : '📂'
+      text += `${icon} *${r.name}*\n`
+      if (r.description) text += `   ${r.description.slice(0, 50)}\n`
+      text += `   ${r.url}\n\n`
+    })
+    await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', disable_web_page_preview: true })
+  } catch (error) {
+    await bot.sendMessage(chatId, `❌ Error: ${error.message}`)
+  }
+})
+
+// /newrepo command - create repo
+bot.onText(/\/newrepo(?:\s+(\S+)(?:\s+(.+))?)?/, async (msg, match) => {
+  const chatId = msg.chat.id
+  const userId = msg.from.id
+  
+  if (!isOwner(userId)) {
+    await bot.sendMessage(chatId, '🔒 This command is owner-only.')
+    return
+  }
+  
+  const name = match[1]?.trim()
+  const description = match[2]?.trim() || ''
+  
+  if (!name) {
+    await bot.sendMessage(chatId, 'Usage: /newrepo [name] [description]\nExample: /newrepo my-project A cool project')
+    return
+  }
+  
+  await bot.sendChatAction(chatId, 'typing')
+  
+  try {
+    const repo = await github.createRepo(name, description)
+    await bot.sendMessage(chatId,
+      `✅ *Repo Created!*\n\n` +
+      `📦 *${repo.name}*\n` +
+      `🔗 ${repo.url}\n` +
+      `📋 Clone: \`${repo.cloneUrl}\``,
+      { parse_mode: 'Markdown', disable_web_page_preview: true }
+    )
+  } catch (error) {
+    await bot.sendMessage(chatId, `❌ Error: ${error.message}`)
+  }
+})
+
+// /gist command - create gist
+bot.onText(/\/gist(?:\s+(.+))?/, async (msg, match) => {
+  const chatId = msg.chat.id
+  const userId = msg.from.id
+  
+  if (!isOwner(userId)) {
+    await bot.sendMessage(chatId, '🔒 This command is owner-only.')
+    return
+  }
+  
+  // Check if replying to a message
+  if (!msg.reply_to_message?.text) {
+    await bot.sendMessage(chatId,
+      'Usage: Reply to a message with /gist [description]\n' +
+      'The replied message will become the gist content.'
+    )
+    return
+  }
+  
+  const description = match[1]?.trim() || 'Created by Sijang'
+  const content = msg.reply_to_message.text
+  
+  await bot.sendChatAction(chatId, 'typing')
+  
+  try {
+    const gist = await github.createGist(description, 'snippet.txt', content)
+    await bot.sendMessage(chatId,
+      `✅ *Gist Created!*\n\n` +
+      `📝 ${description}\n` +
+      `🔗 ${gist.url}`,
+      { parse_mode: 'Markdown', disable_web_page_preview: true }
+    )
+  } catch (error) {
+    await bot.sendMessage(chatId, `❌ Error: ${error.message}`)
+  }
+})
+
+// /push command - push file to repo
+bot.onText(/\/push(?:\s+(\S+)(?:\s+(\S+))?)?/, async (msg, match) => {
+  const chatId = msg.chat.id
+  const userId = msg.from.id
+  
+  if (!isOwner(userId)) {
+    await bot.sendMessage(chatId, '🔒 This command is owner-only.')
+    return
+  }
+  
+  const repo = match[1]?.trim()
+  const filepath = match[2]?.trim()
+  
+  if (!repo || !filepath || !msg.reply_to_message?.text) {
+    await bot.sendMessage(chatId,
+      'Usage: Reply to a message with /push [repo] [filepath]\n' +
+      'Example: /push my-project src/hello.js\n\n' +
+      'The replied message content will be pushed as the file.'
+    )
+    return
+  }
+  
+  const content = msg.reply_to_message.text
+  
+  await bot.sendChatAction(chatId, 'typing')
+  
+  try {
+    const result = await github.pushFile(repo, filepath, content, `Update ${filepath} via Sijang`)
+    await bot.sendMessage(chatId,
+      `✅ *Pushed!*\n\n` +
+      `📄 \`${result.path}\`\n` +
+      `📦 Repo: ${repo}\n` +
+      `🔗 ${result.url}`,
+      { parse_mode: 'Markdown', disable_web_page_preview: true }
+    )
+  } catch (error) {
+    await bot.sendMessage(chatId, `❌ Error: ${error.message}`)
+  }
+})
+
+// /files command - list files in repo
+bot.onText(/\/files(?:\s+(\S+)(?:\s+(.+))?)?/, async (msg, match) => {
+  const chatId = msg.chat.id
+  const userId = msg.from.id
+  
+  if (!isOwner(userId)) {
+    await bot.sendMessage(chatId, '🔒 This command is owner-only.')
+    return
+  }
+  
+  const repo = match[1]?.trim()
+  const path = match[2]?.trim() || ''
+  
+  if (!repo) {
+    await bot.sendMessage(chatId, 'Usage: /files [repo] [path]\nExample: /files sijang src/')
+    return
+  }
+  
+  await bot.sendChatAction(chatId, 'typing')
+  
+  try {
+    const files = await github.listFiles(repo, path)
+    let text = `📁 *${repo}${path ? '/' + path : ''}*\n\n`
+    files.forEach(f => {
+      const icon = f.type === 'dir' ? '📁' : '📄'
+      text += `${icon} ${f.name}\n`
+    })
+    await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' })
+  } catch (error) {
+    await bot.sendMessage(chatId, `❌ Error: ${error.message}`)
+  }
+})
+
+// /cat command - read file from repo
+bot.onText(/\/cat(?:\s+(\S+)(?:\s+(.+))?)?/, async (msg, match) => {
+  const chatId = msg.chat.id
+  const userId = msg.from.id
+  
+  if (!isOwner(userId)) {
+    await bot.sendMessage(chatId, '🔒 This command is owner-only.')
+    return
+  }
+  
+  const repo = match[1]?.trim()
+  const filepath = match[2]?.trim()
+  
+  if (!repo || !filepath) {
+    await bot.sendMessage(chatId, 'Usage: /cat [repo] [filepath]\nExample: /cat sijang package.json')
+    return
+  }
+  
+  await bot.sendChatAction(chatId, 'typing')
+  
+  try {
+    const file = await github.getFile(repo, filepath)
+    if (!file) {
+      await bot.sendMessage(chatId, '❌ File not found')
+      return
+    }
+    
+    // Truncate if too long
+    let content = file.content
+    if (content.length > 4000) {
+      content = content.slice(0, 4000) + '\n\n... (truncated)'
+    }
+    
+    await bot.sendMessage(chatId, `📄 *${filepath}*\n\n\`\`\`\n${content}\n\`\`\``, { parse_mode: 'Markdown' })
+  } catch (error) {
+    await bot.sendMessage(chatId, `❌ Error: ${error.message}`)
+  }
+})
 
 // Handle photos
 bot.on('photo', async (msg) => {
