@@ -12,7 +12,7 @@ const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null
 const BOT_NAME = process.env.BOT_NAME || 'Sijang'
 const BOT_PERSONALITY = process.env.BOT_PERSONALITY || 'adaptable, helpful, friendly'
 
-const SYSTEM_PROMPT = `You are ${BOT_NAME}, an AI assistant on Telegram.
+const BASE_SYSTEM_PROMPT = `You are ${BOT_NAME}, an AI assistant on Telegram.
 
 Your personality: ${BOT_PERSONALITY}
 
@@ -24,12 +24,56 @@ Key traits:
 - If you don't know something, say so honestly
 - You can help with: general questions, coding, crypto prices, web searches, reminders, and more
 
-Keep responses concise unless the user asks for detail. Be real, be helpful, be ${BOT_NAME}.`
+Keep responses concise unless the user asks for detail. Be real, be helpful, be ${BOT_NAME}.
+
+IMPORTANT: When you learn new facts about the user (their name, job, interests, preferences, location, relationships, etc.), include a JSON block at the END of your response like this:
+<LEARN>{"category": "personal", "fact": "User's name is John", "confidence": 0.9}</LEARN>
+
+Categories: personal (name, age, job), preferences (likes, dislikes), facts (things they mentioned), relationships (people they know), context (current situation)
+
+Only include <LEARN> when you genuinely learn something new and meaningful. Don't include it in every message.`
+
+// Build system prompt with user context
+function buildSystemPrompt(userContext = '') {
+  let prompt = BASE_SYSTEM_PROMPT
+  if (userContext) {
+    prompt += `\n\n=== WHAT YOU KNOW ABOUT THIS USER ===\n${userContext}\n===`
+  }
+  return prompt
+}
+
+// Parse learned facts from response
+function parseLearnedFacts(response) {
+  const facts = []
+  const learnRegex = /<LEARN>({.*?})<\/LEARN>/gs
+  let match
+  
+  while ((match = learnRegex.exec(response)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1])
+      if (parsed.category && parsed.fact) {
+        facts.push({
+          category: parsed.category,
+          fact: parsed.fact,
+          confidence: parsed.confidence || 0.8
+        })
+      }
+    } catch (e) {
+      // Ignore invalid JSON
+    }
+  }
+  
+  // Clean the response - remove <LEARN> tags
+  const cleanResponse = response.replace(/<LEARN>.*?<\/LEARN>/gs, '').trim()
+  
+  return { cleanResponse, facts }
+}
 
 // Groq chat (primary - free and fast)
-async function chatWithGroq(messages, userMessage) {
+async function chatWithGroq(messages, userMessage, userContext = '') {
+  const systemPrompt = buildSystemPrompt(userContext)
   const groqMessages = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: systemPrompt },
     ...messages.filter(m => m.content?.trim()).map(m => ({
       role: m.role === 'assistant' ? 'assistant' : 'user',
       content: m.content
@@ -53,10 +97,11 @@ async function chatWithGroq(messages, userMessage) {
 }
 
 // Gemini chat (fallback)
-async function chatWithGemini(messages, userMessage) {
+async function chatWithGemini(messages, userMessage, userContext = '') {
+  const systemPrompt = buildSystemPrompt(userContext)
   const model = genAI.getGenerativeModel({ 
     model: 'gemini-2.0-flash',
-    systemInstruction: SYSTEM_PROMPT
+    systemInstruction: systemPrompt
   })
   
   const history = messages
@@ -77,11 +122,14 @@ async function chatWithGemini(messages, userMessage) {
 }
 
 // Main chat function - tries Groq first, falls back to Gemini
-async function chat(messages, userMessage) {
+// Returns { response, facts } where facts are things learned about the user
+async function chat(messages, userMessage, userContext = '') {
+  let rawResponse = ''
+  
   // Try Groq first (free, fast, generous limits)
   if (GROQ_API_KEY) {
     try {
-      return await chatWithGroq(messages, userMessage)
+      rawResponse = await chatWithGroq(messages, userMessage, userContext)
     } catch (error) {
       console.error('Groq error:', error.response?.data || error.message)
       // Fall through to Gemini
@@ -89,16 +137,23 @@ async function chat(messages, userMessage) {
   }
   
   // Try Gemini as fallback
-  if (genAI) {
+  if (!rawResponse && genAI) {
     try {
-      return await chatWithGemini(messages, userMessage)
+      rawResponse = await chatWithGemini(messages, userMessage, userContext)
     } catch (error) {
       console.error('Gemini error:', error.message)
       throw error
     }
   }
   
-  throw new Error('No AI provider configured. Set GROQ_API_KEY or GEMINI_API_KEY.')
+  if (!rawResponse) {
+    throw new Error('No AI provider configured. Set GROQ_API_KEY or GEMINI_API_KEY.')
+  }
+  
+  // Parse any learned facts from the response
+  const { cleanResponse, facts } = parseLearnedFacts(rawResponse)
+  
+  return { response: cleanResponse, facts }
 }
 
 // Image analysis (Gemini only for now)
@@ -132,4 +187,4 @@ async function chatWithImage(messages, userMessage, imageBuffer, mimeType = 'ima
   }
 }
 
-module.exports = { chat, chatWithImage }
+module.exports = { chat, chatWithImage, parseLearnedFacts }

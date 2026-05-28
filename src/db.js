@@ -72,6 +72,43 @@ async function initDb() {
     )
   `)
   
+  // Long-term memory / facts learned about user
+  db.run(`
+    CREATE TABLE IF NOT EXISTS long_term_memory (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      telegram_id INTEGER NOT NULL,
+      category TEXT NOT NULL,
+      fact TEXT NOT NULL,
+      confidence REAL DEFAULT 1.0,
+      source TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `)
+  
+  // User preferences
+  db.run(`
+    CREATE TABLE IF NOT EXISTS preferences (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      telegram_id INTEGER NOT NULL,
+      pref_key TEXT NOT NULL,
+      pref_value TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(telegram_id, pref_key)
+    )
+  `)
+  
+  // Conversation summaries (for context across sessions)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS conversation_summaries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      telegram_id INTEGER NOT NULL,
+      summary TEXT NOT NULL,
+      message_count INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `)
+  
   saveDb()
   console.log('💾 Database initialized')
 }
@@ -212,6 +249,171 @@ function deleteReminder(id, telegramId) {
   run('DELETE FROM reminders WHERE id = ? AND telegram_id = ?', [id, telegramId])
 }
 
+// ========== LONG-TERM MEMORY ==========
+
+// Categories: personal, preferences, facts, context, relationships
+function learnFact(telegramId, category, fact, source = 'conversation') {
+  // Check for similar existing fact
+  const existing = get(
+    `SELECT id, fact FROM long_term_memory 
+     WHERE telegram_id = ? AND category = ? AND fact LIKE ?`,
+    [telegramId, category, `%${fact.slice(0, 20)}%`]
+  )
+  
+  if (existing) {
+    // Update existing fact
+    run(
+      `UPDATE long_term_memory 
+       SET fact = ?, updated_at = CURRENT_TIMESTAMP, confidence = MIN(confidence + 0.1, 1.0)
+       WHERE id = ?`,
+      [fact, existing.id]
+    )
+    return { updated: true, id: existing.id }
+  } else {
+    // Insert new fact
+    run(
+      `INSERT INTO long_term_memory (telegram_id, category, fact, source) 
+       VALUES (?, ?, ?, ?)`,
+      [telegramId, category, fact, source]
+    )
+    return { updated: false, id: null }
+  }
+}
+
+function getFactsByCategory(telegramId, category) {
+  return all(
+    `SELECT * FROM long_term_memory 
+     WHERE telegram_id = ? AND category = ? 
+     ORDER BY confidence DESC, updated_at DESC`,
+    [telegramId, category]
+  )
+}
+
+function getAllFacts(telegramId) {
+  return all(
+    `SELECT * FROM long_term_memory 
+     WHERE telegram_id = ? 
+     ORDER BY category, confidence DESC`,
+    [telegramId]
+  )
+}
+
+function searchFacts(telegramId, query) {
+  return all(
+    `SELECT * FROM long_term_memory 
+     WHERE telegram_id = ? AND fact LIKE ? 
+     ORDER BY confidence DESC`,
+    [telegramId, `%${query}%`]
+  )
+}
+
+function deleteFact(id, telegramId) {
+  run('DELETE FROM long_term_memory WHERE id = ? AND telegram_id = ?', [id, telegramId])
+}
+
+// ========== PREFERENCES ==========
+
+function setPreference(telegramId, key, value) {
+  const existing = get(
+    'SELECT id FROM preferences WHERE telegram_id = ? AND pref_key = ?',
+    [telegramId, key]
+  )
+  if (existing) {
+    run('UPDATE preferences SET pref_value = ? WHERE id = ?', [value, existing.id])
+  } else {
+    run('INSERT INTO preferences (telegram_id, pref_key, pref_value) VALUES (?, ?, ?)',
+      [telegramId, key, value])
+  }
+}
+
+function getPreference(telegramId, key) {
+  const row = get(
+    'SELECT pref_value FROM preferences WHERE telegram_id = ? AND pref_key = ?',
+    [telegramId, key]
+  )
+  return row?.pref_value
+}
+
+function getAllPreferences(telegramId) {
+  return all('SELECT pref_key, pref_value FROM preferences WHERE telegram_id = ?', [telegramId])
+}
+
+// ========== CONVERSATION SUMMARIES ==========
+
+function saveConversationSummary(telegramId, summary, messageCount) {
+  run(
+    'INSERT INTO conversation_summaries (telegram_id, summary, message_count) VALUES (?, ?, ?)',
+    [telegramId, summary, messageCount]
+  )
+}
+
+function getRecentSummaries(telegramId, limit = 5) {
+  return all(
+    `SELECT * FROM conversation_summaries 
+     WHERE telegram_id = ? 
+     ORDER BY created_at DESC LIMIT ?`,
+    [telegramId, limit]
+  )
+}
+
+// ========== CONTEXT BUILDER ==========
+
+// Build a context string with everything we know about the user
+function buildUserContext(telegramId) {
+  const user = get('SELECT * FROM users WHERE telegram_id = ?', [telegramId])
+  const facts = getAllFacts(telegramId)
+  const prefs = getAllPreferences(telegramId)
+  const summaries = getRecentSummaries(telegramId, 3)
+  const memories = getAllMemories(telegramId)
+  
+  let context = ''
+  
+  // User basics
+  if (user) {
+    context += `User: ${user.first_name || user.username || 'Unknown'}\n`
+  }
+  
+  // Facts by category
+  if (facts.length > 0) {
+    const byCategory = {}
+    facts.forEach(f => {
+      if (!byCategory[f.category]) byCategory[f.category] = []
+      byCategory[f.category].push(f.fact)
+    })
+    
+    context += '\nThings I know about this user:\n'
+    for (const [cat, factList] of Object.entries(byCategory)) {
+      context += `[${cat}]: ${factList.join('; ')}\n`
+    }
+  }
+  
+  // Preferences
+  if (prefs.length > 0) {
+    context += '\nUser preferences:\n'
+    prefs.forEach(p => {
+      context += `- ${p.pref_key}: ${p.pref_value}\n`
+    })
+  }
+  
+  // Explicit memories
+  if (memories.length > 0) {
+    context += '\nUser-saved memories:\n'
+    memories.forEach(m => {
+      context += `- ${m.key}: ${m.value}\n`
+    })
+  }
+  
+  // Recent conversation summaries
+  if (summaries.length > 0) {
+    context += '\nRecent conversation summaries:\n'
+    summaries.forEach(s => {
+      context += `- ${s.summary}\n`
+    })
+  }
+  
+  return context.trim()
+}
+
 module.exports = {
   initDb,
   getOrCreateUser,
@@ -226,5 +428,20 @@ module.exports = {
   getDueReminders,
   markReminderSent,
   getUserReminders,
-  deleteReminder
+  deleteReminder,
+  // Long-term memory
+  learnFact,
+  getFactsByCategory,
+  getAllFacts,
+  searchFacts,
+  deleteFact,
+  // Preferences
+  setPreference,
+  getPreference,
+  getAllPreferences,
+  // Conversation summaries
+  saveConversationSummary,
+  getRecentSummaries,
+  // Context builder
+  buildUserContext
 }

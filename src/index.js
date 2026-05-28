@@ -20,7 +20,21 @@ const {
   getDueReminders,
   markReminderSent,
   getUserReminders,
-  deleteReminder
+  deleteReminder,
+  // Long-term memory
+  learnFact,
+  getAllFacts,
+  searchFacts,
+  deleteFact,
+  // Preferences
+  setPreference,
+  getPreference,
+  getAllPreferences,
+  // Conversation summaries
+  saveConversationSummary,
+  getRecentSummaries,
+  // Context builder
+  buildUserContext
 } = require('./db')
 const { chat, chatWithImage } = require('./services/gemini')
 const { getPrice, formatPrice, formatChange, formatMarketCap, getTrending } = require('./services/crypto')
@@ -123,7 +137,9 @@ bot.onText(/\/help/, async (msg) => {
     `/remember [key] [value] - Save something\n` +
     `/recall [key] - Retrieve it\n` +
     `/memories - List all memories\n` +
-    `/forget [key] - Delete memory\n\n` +
+    `/forget [key] - Delete memory\n` +
+    `/brain - What I've learned about you\n` +
+    `/amnesia - Wipe my memory of you\n\n` +
     `*Reminders*\n` +
     `/remind [time] [message]\n` +
     `/reminders - List pending\n` +
@@ -315,6 +331,76 @@ bot.onText(/\/forget(?:\s+(.+))?/, async (msg, match) => {
   
   forget(userId, key)
   await bot.sendMessage(chatId, `🗑️ Forgot "${key}"`)
+})
+
+// /brain command - show what Sijang has learned about the user
+bot.onText(/\/brain/, async (msg) => {
+  const chatId = msg.chat.id
+  const userId = msg.from.id
+  
+  const facts = getAllFacts(userId)
+  const prefs = getAllPreferences(userId)
+  const summaries = getRecentSummaries(userId, 3)
+  
+  if (facts.length === 0 && prefs.length === 0 && summaries.length === 0) {
+    await bot.sendMessage(chatId, 
+      '🧠 My brain is empty about you!\n\n' +
+      'Chat with me and I\'ll learn things about you automatically.'
+    )
+    return
+  }
+  
+  let text = '🧠 *What I Know About You*\n\n'
+  
+  // Group facts by category
+  if (facts.length > 0) {
+    const byCategory = {}
+    facts.forEach(f => {
+      if (!byCategory[f.category]) byCategory[f.category] = []
+      byCategory[f.category].push(f)
+    })
+    
+    for (const [cat, catFacts] of Object.entries(byCategory)) {
+      text += `*${cat.charAt(0).toUpperCase() + cat.slice(1)}*\n`
+      catFacts.forEach(f => {
+        text += `  - ${f.fact}\n`
+      })
+      text += '\n'
+    }
+  }
+  
+  if (prefs.length > 0) {
+    text += '*Preferences*\n'
+    prefs.forEach(p => {
+      text += `  - ${p.pref_key}: ${p.pref_value}\n`
+    })
+    text += '\n'
+  }
+  
+  if (summaries.length > 0) {
+    text += '*Recent Topics*\n'
+    summaries.forEach(s => {
+      text += `  - ${s.summary.slice(0, 100)}...\n`
+    })
+  }
+  
+  text += '\n_Use /amnesia to clear all learned data_'
+  
+  await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' })
+})
+
+// /amnesia command - clear all long-term memory
+bot.onText(/\/amnesia/, async (msg) => {
+  const chatId = msg.chat.id
+  const userId = msg.from.id
+  
+  // Get all facts and delete them
+  const facts = getAllFacts(userId)
+  for (const fact of facts) {
+    deleteFact(fact.id, userId)
+  }
+  
+  await bot.sendMessage(chatId, '🧠💨 Memory wiped! I\'ve forgotten everything I learned about you.')
 })
 
 // /remind command
@@ -682,11 +768,22 @@ bot.on('message', async (msg) => {
     // Get conversation history
     const history = getRecentMessages(userId)
     
+    // Build user context from long-term memory
+    const userContext = buildUserContext(userId)
+    
     // Save user message
     addMessage(userId, 'user', text)
     
-    // Get AI response
-    const reply = await chat(history, text)
+    // Get AI response with context
+    const { response: reply, facts } = await chat(history, text, userContext)
+    
+    // Save any learned facts to long-term memory
+    if (facts && facts.length > 0) {
+      for (const fact of facts) {
+        learnFact(userId, fact.category, fact.fact, 'conversation')
+        console.log(`🧠 Learned: [${fact.category}] ${fact.fact}`)
+      }
+    }
     
     // Save assistant response
     addMessage(userId, 'assistant', reply)
